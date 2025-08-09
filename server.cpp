@@ -34,6 +34,13 @@ struct Conn {
     std::vector<uint8_t> outgoing;                                  // write buffer
 };
 
+struct Buffer {                                                     // rather than removing from front of FIFO vector (O(n^2)), we advance a pointer
+    uint8_t *buffer_begin;
+    uint8_t *buffer_end;
+    uint8_t *data_begin;
+    uint8_t *data_end;
+};
+
 static int32_t read_full(int fd, char* buf, size_t n) {             // restrict to current file with static
     while (n > 0) {
         ssize_t rv = read(fd, buf, n);
@@ -98,6 +105,49 @@ static Conn* handle_accept(int fd) {                                    // creat
     return conn;
 }
 
+static void handle_read(Conn* conn) {                                   // single read per handle_read() call, event loop reads in chunks
+    uint8_t buf[64 * 1024];
+
+    ssize_t rv = read(conn->fd, buf, sizeof(buf));
+    if (rv <= 0) {                                                      // handle IO Error (rv < 0) and EOF (rv == 0)                  
+        conn->want_close = true;
+        return;
+    }
+
+    buf_append(conn->incoming, buf, rv);
+
+    while (try_one_request(conn)) {}                                    // treat input buffer as byte stream (multiple pipelined requests)
+
+    // update readiness intention
+    if (conn->outgoing.size() > 0) {
+        conn->want_read = false;
+        conn->want_write = true;
+
+        return handle_write(conn);                                      // optimization for request-response protocol
+    }                                                                   // assume client is ready to be written to because it has sent a request
+}                                                                       // thus server can write a response without waiting for event loop
+
+static void handle_write(Conn* conn) {
+    assert(conn->outgoing.size() > 0);
+
+    ssize_t rv = write(conn->fd, conn->outgoing.data(), conn->outgoing.size());
+    if (rv < 0) {
+        if (errno == EAGAIN)                                            // if client is not reading, send buffer (kernel buffer) fills up
+            return;
+
+        conn->want_close = true;
+        return;
+    }
+
+    // remove written data from buffer
+    buf_consume(conn->outgoing, (size_t)rv);
+
+    if (conn->incoming.size() == 0) {                                   // either read or write
+        conn->want_read = true;
+        conn->want_write = false;
+    }
+}
+
 static bool try_one_request(Conn* conn) {                               // if not enough data, do nothing and wait for future iteration
     if (conn->incoming.size() < 4) {
         return false;
@@ -124,46 +174,8 @@ static bool try_one_request(Conn* conn) {                               // if no
     buf_append(conn->outgoing, request, len);
 
     // clear incoming buffer
-    buf_consume(conn->incoming, len + 4);                               // don't empty buffer because of pipelining
+    buf_consume(conn->incoming, len + 4);                               // don't empty buffer because of pipelining (more requests in buffer)
     return true;                                                        // multiple messages can arrive back-to-back in a single read operation
-}
-
-static void handle_read(Conn* conn) {
-    uint8_t buf[64 * 1024];
-
-    ssize_t rv = read(conn->fd, buf, sizeof(buf));
-    if (rv <= 0) {                                                      // handle IO Error (rv < 0) and EOF (rv == 0)                  
-        conn->want_close = true;
-        return;
-    }
-
-    buf_append(conn->incoming, buf, rv);
-
-    try_one_request(conn);
-
-    // update readiness intention
-    if (conn->outgoing.size() > 0) {
-        conn->want_read = false;
-        conn->want_write = true;
-    }
-}
-
-static void handle_write(Conn* conn) {
-    assert(conn->outgoing.size() > 0);
-
-    ssize_t rv = write(conn->fd, conn->outgoing.data(), conn->outgoing.size());
-    if (rv < 0) {
-        conn->want_close = true;
-        return;
-    }
-
-    // remove written data from buffer
-    buf_consume(conn->outgoing, (size_t)rv);
-
-    if (conn->incoming.size() == 0) {                                   // either read or write
-        conn->want_read = true;
-        conn->want_write = false;
-    }
 }
 
 

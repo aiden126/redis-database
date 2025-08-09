@@ -7,6 +7,8 @@
 #include <cassert>         // assert
 #include <cerrno>          // errno
 #include <cstring>         // memcpy
+#include <vector>
+#include <string>
 
 
 // struct sockaddr_in {
@@ -116,17 +118,17 @@ int main(void) {
         return 1;
     }
 
-    // send multiple requests
-    int32_t err = query(fd, "hello1");                                  // request 1
-    if (err) {
-        goto L_DONE;
-    }
-    err = query(fd, "hello2");                                          // request 2
-    if (err) {
-        goto L_DONE;
+    std::vector<std::string> query_list = {
+        "hello1", "hello2", "hello3"
+    };
+
+    for (const std::string &q : query_list) {
+        int32_t err = query(fd, q.c_str());
+        if (err) {
+            printf("error sending query %s\n", q.c_str());
+        }
     }
 
-L_DONE:                                                                 // clean up label
     close(fd);
 
     return 0;
