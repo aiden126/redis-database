@@ -1,27 +1,37 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <stdio.h>
-#include <arpa/inet.h>     // for htons, htonl, struct in_addr, sockaddr_in
-#include <netinet/in.h>    // for sockaddr_in and in_addr
+#include <arpa/inet.h>     // htons, htonl, struct in_addr, sockaddr_in
+#include <netinet/in.h>    // sockaddr_in and in_addr
 #include <cassert>         // assert
 #include <cerrno>          // errno
 #include <cstring>         // memcpy
-#include <vector>
 #include <poll.h>
 #include <fcntl.h>         // file control
+#include <vector>
+#include <string>
+#include <map>
 
+/*
+struct sockaddr_in {
+    u_int16_t sin_family;                                        // IP version
+    u_int16_t sin_port;
+    struct in_addr sin_addr;                                     // IPv4
+};
 
-// struct sockaddr_in {
-//     u_int16_t sin_family;                                        // IP version
-//     u_int16_t sin_port;
-//     struct in_addr sin_addr;                                     // IPv4
-// };
-
-// struct in_addr {
-//     u_int32_t s_addr;                                            // IPv4 in big-endian
-// };
+struct in_addr {
+    u_int32_t s_addr;                                            // IPv4 in big-endian
+};
+*/
 
 const size_t k_max_msg = 4096;
+
+struct Buffer {                                                     // rather than removing from front of FIFO vector (O(n^2)), we advance a pointer
+    uint8_t *buffer_begin;
+    uint8_t *buffer_end;
+    uint8_t *data_begin;
+    uint8_t *data_end;
+};
 
 struct Conn {
     int fd = -1;
@@ -34,12 +44,52 @@ struct Conn {
     std::vector<uint8_t> outgoing;                                  // write buffer
 };
 
-struct Buffer {                                                     // rather than removing from front of FIFO vector (O(n^2)), we advance a pointer
-    uint8_t *buffer_begin;
-    uint8_t *buffer_end;
-    uint8_t *data_begin;
-    uint8_t *data_end;
+enum {
+    RES_OK = 0,         
+    RES_ERR = 1,        // error
+    RES_NX = 2,         // key not found
 };
+
+struct Response {
+    uint32_t status = 0;
+    std::vector<uint8_t> data;
+}; 
+
+std::map<std::string, std::string> g_data;
+
+static void fd_set_nb(int fd) {                                         // sets listening socket to non blocking
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);             // accept() returns immediately with new connection or EAGAIN
+}
+
+static void buf_append(std::vector<uint8_t> &buf, const uint8_t* data, size_t len) {
+    buf.insert(buf.end(), data, data + len);
+}
+
+static void buf_consume(std::vector<uint8_t> &buf, size_t n) {
+    buf.erase(buf.begin(), buf.begin() + n);
+}
+
+// read (int) 4 bytes from byte stream
+static bool read_u32(const uint8_t *&cur, const uint8_t *end, uint32_t &out) { 
+    if (cur + 4 > end) {
+        return false;
+    }
+
+    memcpy(&out, cur, 4);
+    cur += 4;
+    return true;
+}
+
+// read (string) n bytes from byte stream
+static bool read_str(const uint8_t *&cur, const uint8_t *end, size_t n, std::string &out) {
+    if (cur + n > end) {
+        return false;
+    }
+
+    out.assign(cur, cur + n);
+    cur += n;
+    return true;
+}
 
 static int32_t read_full(int fd, char* buf, size_t n) {             // restrict to current file with static
     while (n > 0) {
@@ -74,16 +124,102 @@ static int32_t write_all(int fd, char* buf, size_t n) {
     return 0;
 }
 
-static void fd_set_nb(int fd) {                                         // sets listening socket to non blocking
-    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);             // accept() returns immediately with new connection or EAGAIN
+static int32_t parse_req(const uint8_t *data, size_t size, std::vector<std::string> &out) {
+    const uint8_t *end = data + size;
+    uint32_t nstr = 0;
+    if (!read_u32(data, end, nstr)) {
+        printf("error reading nstr\n");
+        return -1;
+    }
+
+    if (nstr > k_max_msg) {
+        printf("nstr too large\n");
+        return -1;
+    }
+
+    while (out.size() < nstr) {
+        uint32_t len = 0;
+        if (!read_u32(data, end, len)) {
+            printf("error reading request len\n");
+            return -1;
+        }
+
+        out.push_back(std::string());
+        if (!read_str(data, end, len, out.back())) {
+            printf("error reading request str\n");
+            return -1;
+        }
+    }
+
+    if (data != end) {
+        return -1;                                                      // trailing garbage
+    }
+
+    return 0;
 }
 
-static void buf_append(std::vector<uint8_t> &buf, const uint8_t* data, size_t len) {
-    buf.insert(buf.end(), data, data + len);
+static void do_request(std::vector<std::string> &cmd, Response &out) {
+    if (cmd.size() == 2 && cmd[0] == "get") {
+        auto it = g_data.find(cmd[1]);
+        if (it == g_data.end()) {
+            out.status = RES_NX;
+            return;
+        }
+
+        const std::string &val = it->second;
+        out.data.assign(val.begin(), val.end());
+    } else if (cmd.size() == 3 && cmd[0] == "set") {
+        g_data[cmd[1]].swap(cmd[2]);                                    // faster assignment and saves old value in cmd[2]
+    } else if (cmd.size() == 2 && cmd[0] == "del") {
+        g_data.erase(cmd[1]);
+    } else {
+        out.status = RES_ERR;
+    }
 }
 
-static void buf_consume(std::vector<uint8_t> &buf, size_t n) {
-    buf.erase(buf.begin(), buf.begin() + n);
+static void make_response(const Response &resp, std::vector<uint8_t> &out) {
+    uint32_t resp_len = 4 + (uint32_t)resp.data.size();
+    buf_append(out, (const uint8_t*)&resp_len, 4);
+    buf_append(out, (const uint8_t*)&resp.status, 4);
+    buf_append(out, (const uint8_t*)resp.data.data(), resp.data.size());
+}
+
+static bool try_one_request(Conn* conn) {                               // if not enough data, do nothing and wait for future iteration
+    if (conn->incoming.size() < 4) {
+        return false;
+    }
+
+    uint32_t len = 0;                                                   // read message header (len)
+    memcpy(&len, conn->incoming.data(), 4);
+    if (len > k_max_msg) {                                              // protocol error, message body too long       
+        conn->want_close = true;
+        return false;
+    }
+
+    if (4 + len > conn->incoming.size()) {                              // check if full message has been received yet
+        return false;                                                   // + 4 bytes for len header
+    }
+
+    const uint8_t* request = &conn->incoming[4];
+
+    // parse the requests 
+    std::vector<std::string> cmd;
+    if (parse_req(request, len, cmd) < 0) {
+        conn->want_close = true;
+        printf("error parsing request\n");
+        return false;
+    }
+
+    // generate response
+    Response resp;
+
+    do_request(cmd, resp);
+
+    make_response(resp, conn->outgoing);
+
+    // clear incoming buffer
+    buf_consume(conn->incoming, len + 4);                               // don't empty buffer because of pipelining (more requests in buffer)
+    return true;                                                        // multiple messages can arrive back-to-back in a single read operation
 }
 
 static Conn* handle_accept(int fd) {                                    // creates a nonblocking listening connection waiting for 1st request
@@ -103,6 +239,27 @@ static Conn* handle_accept(int fd) {                                    // creat
     conn->fd = conn_fd;
     conn->want_read = true;                                             // reads 1st request
     return conn;
+}
+
+static void handle_write(Conn* conn) {
+    assert(conn->outgoing.size() > 0);
+
+    ssize_t rv = write(conn->fd, conn->outgoing.data(), conn->outgoing.size());
+    if (rv < 0) {
+        if (errno == EAGAIN)                                            // if client is not reading, send buffer (kernel buffer) fills up
+            return;
+
+        conn->want_close = true;
+        return;
+    }
+
+    // remove written data from buffer
+    buf_consume(conn->outgoing, (size_t)rv);
+
+    if (conn->incoming.size() == 0) {                                   // either read or write
+        conn->want_read = true;
+        conn->want_write = false;
+    }
 }
 
 static void handle_read(Conn* conn) {                                   // single read per handle_read() call, event loop reads in chunks
@@ -126,58 +283,6 @@ static void handle_read(Conn* conn) {                                   // singl
         return handle_write(conn);                                      // optimization for request-response protocol
     }                                                                   // assume client is ready to be written to because it has sent a request
 }                                                                       // thus server can write a response without waiting for event loop
-
-static void handle_write(Conn* conn) {
-    assert(conn->outgoing.size() > 0);
-
-    ssize_t rv = write(conn->fd, conn->outgoing.data(), conn->outgoing.size());
-    if (rv < 0) {
-        if (errno == EAGAIN)                                            // if client is not reading, send buffer (kernel buffer) fills up
-            return;
-
-        conn->want_close = true;
-        return;
-    }
-
-    // remove written data from buffer
-    buf_consume(conn->outgoing, (size_t)rv);
-
-    if (conn->incoming.size() == 0) {                                   // either read or write
-        conn->want_read = true;
-        conn->want_write = false;
-    }
-}
-
-static bool try_one_request(Conn* conn) {                               // if not enough data, do nothing and wait for future iteration
-    if (conn->incoming.size() < 4) {
-        return false;
-    }
-
-    uint32_t len = 0;                                                   // read message header (len)
-    memcpy(&len, conn->incoming.data(), 4);
-    if (len > k_max_msg) {                                              // protocol error, message body too long       
-        conn->want_close = true;
-        return false;
-    }
-
-    if (4 + len > conn->incoming.size()) {                              // check if full message has been received yet
-        return false;                                                   // + 4 bytes for len header
-    }
-
-    const uint8_t* request = &conn->incoming[4];
-
-    // process the parsed message 
-    printf("client says: len:%d data:%.*s\n", len, len < 100 ? len : 100, request);
-
-    // generate response
-    buf_append(conn->outgoing, (const uint8_t*)&len, 4);
-    buf_append(conn->outgoing, request, len);
-
-    // clear incoming buffer
-    buf_consume(conn->incoming, len + 4);                               // don't empty buffer because of pipelining (more requests in buffer)
-    return true;                                                        // multiple messages can arrive back-to-back in a single read operation
-}
-
 
 int main(void) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);                           // obtain socket handle
