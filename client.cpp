@@ -1,39 +1,32 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <stdio.h>
+#include <arpa/inet.h>
 #include <netinet/in.h>
-#include <arpa/inet.h>     // for htons, htonl, struct in_addr, sockaddr_in
-#include <netinet/in.h>    // for sockaddr_in and in_addr
-#include <cassert>         // assert
-#include <cerrno>          // errno
-#include <cstring>         // memcpy
+
+#include <cassert>
+#include <cerrno>
+#include <cstring>
+#include <poll.h>
+#include <fcntl.h>
+
 #include <vector>
 #include <string>
-
-
-// struct sockaddr_in {
-//     u_int16_t sin_family;       // IP version
-//     u_int16_t sin_port;
-//     struct addr_in sin_addr;    // IPv4
-// };
-
-// struct addr_in {
-//     u_int32_t s_addr;           // IPv4 in big-endian
-// };
+#include <map>
 
 const uint32_t k_max_msg = 4096;
 
-static int32_t read_full(int fd, char* buf, size_t n) {             // restrict to current file with static
+static int32_t read_full(int fd, char* buf, size_t n) {
     while (n > 0) {
         ssize_t rv = read(fd, buf, n);
         if (rv <= 0) {
-            return -1;                                              // error or unexpected EOF
+            return -1;
         }
 
-        assert((size_t)rv <= n);                                    // sanity check
+        assert((size_t)rv <= n)
 
         n -= (size_t)rv;
-        buf += rv;                                                  // move buffer pointer by read bytes
+        buf += rv;
     }
 
     return 0;
@@ -74,7 +67,7 @@ static int32_t query(int fd, const char* text) {
     }
 
     // read response
-    char rbuf[4 + k_max_msg + 1];                                       // allocate extra for defensive coding (null term)
+    char rbuf[4 + k_max_msg + 1];                                       // allocate extra for defensive coding (null terminator)
     errno = 0;
 
     err = read_full(fd, rbuf, 4);
