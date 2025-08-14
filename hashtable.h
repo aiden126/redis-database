@@ -11,3 +11,15 @@ struct HTable {
     size_t mask = 0;
     size_t size = 0;
 };
+
+struct HMap {
+    HTable new_table;
+    HTable old_table;
+    size_t migrate_pos = 0;
+};
+
+HNode *hm_lookup(HMap *hmap, HNode *key, bool (*eq)(HNode*, HNode*));
+
+HNode *hm_delete(HMap *hmap, HNode *key, bool (*eq)(HNode*, HNode*));
+
+void hm_insert(HMap *hmap, HNode *node);

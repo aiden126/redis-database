@@ -23,7 +23,7 @@ static int32_t read_full(int fd, char* buf, size_t n) {
             return -1;
         }
 
-        assert((size_t)rv <= n)
+        assert((size_t)rv <= n);
 
         n -= (size_t)rv;
         buf += rv;
