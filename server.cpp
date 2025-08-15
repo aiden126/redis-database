@@ -33,12 +33,7 @@ struct in_addr {
 
 const size_t k_max_msg = 4096;
 
-struct Buffer {
-    uint8_t *buffer_begin;
-    uint8_t *buffer_end;
-    uint8_t *data_begin;
-    uint8_t *data_end;
-};
+typedef std::vector<uint8_t> Buffer;
 
 struct Conn {
     int fd = -1;
@@ -50,17 +45,6 @@ struct Conn {
     std::vector<uint8_t> incoming;
     std::vector<uint8_t> outgoing;
 };
-
-enum {
-    RES_OK = 0,         
-    RES_ERR = 1,
-    RES_NX = 2,
-};
-
-struct Response {
-    uint32_t status = 0;
-    std::vector<uint8_t> data;
-}; 
 
 static struct {
     HMap db;
@@ -98,6 +82,70 @@ static void buf_append(std::vector<uint8_t> &buf, const uint8_t* data, size_t le
 
 static void buf_consume(std::vector<uint8_t> &buf, size_t n) {
     buf.erase(buf.begin(), buf.begin() + n);
+}
+
+enum {
+    ERR_UNKNOWN = 1,
+    ERR_TOO_BIG = 2,
+};
+
+enum {
+    TAG_NIL = 0,
+    TAG_ERR = 1,
+    TAG_STR = 2,
+    TAG_INT = 3,
+    TAG_DBL = 4,
+    TAG_ARR = 5,
+};
+
+// helper functions for serialization
+static void buf_append_u8(Buffer &buf, uint8_t data) {
+    buf.push_back(data);
+}
+
+static void buf_append_u32(Buffer &buf, uint32_t data) {
+    buf_append(buf, (const uint8_t *)&data, 4);
+}
+
+static void buf_append_i64(Buffer &buf, int64_t data) {
+    buf_append(buf, (const uint8_t *)&data, 8);
+}
+
+static void buf_append_dbl(Buffer &buf, double data) {
+    buf_append(buf, (const uint8_t *)&data, 8);
+}
+
+// append serialized data to back
+static void out_nil(Buffer &out) {
+    buf_append_u8(out, TAG_NIL);
+}
+
+static void out_str(Buffer &out, const char *s, size_t size) {
+    buf_append_u8(out, TAG_STR);
+    buf_append_u32(out, (uint32_t)size);
+    buf_append(out, (const uint8_t *)s, size);
+}
+
+static void out_int(Buffer &out, int64_t val) {
+    buf_append_u8(out, TAG_INT);
+    buf_append_i64(out, val);
+}
+
+static void out_dbl(Buffer &out, double val) {
+    buf_append_u8(out, TAG_DBL);
+    buf_append_dbl(out, val);
+}
+
+static void out_arr(Buffer &out, uint32_t n) {
+    buf_append_u8(out, TAG_ARR);
+    buf_append_u32(out, n);
+}
+
+static void out_err(Buffer &out, uint32_t code, const std::string &msg) {
+    buf_append_u8(out, TAG_ERR);
+    buf_append_u32(out, code);
+    buf_append_u32(out, (uint32_t)msg.size());
+    buf_append(out, (const uint8_t *)msg.data(), msg.size());
 }
 
 // read (int) 4 bytes from byte stream
@@ -188,23 +236,21 @@ static int32_t parse_req(const uint8_t *data, size_t size, std::vector<std::stri
     return 0;
 }
 
-static void do_get(std::vector<std::string> &cmd, Response &out) {
+static void do_get(std::vector<std::string> &cmd, Buffer &out) {
     struct Entry key;       // dummy entry
     key.key.swap(cmd[1]);
     key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
 
     HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
     if (!node) {
-        out.status = RES_NX;
-        return;
+        return out_nil(out);
     }
 
     const std::string &val = container_of(node, struct Entry, node)->value;
-    assert(val.size() <= k_max_msg);
-    out.data.assign(val.begin(), val.end());
+    return out_str(out, val.data(), val.size());
 }
 
-static void do_set(std::vector<std::string> &cmd, Response &out) {
+static void do_set(std::vector<std::string> &cmd, Buffer &out) {
     struct Entry key;       // dummy entry
     key.key.swap(cmd[1]);
     key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
@@ -221,9 +267,11 @@ static void do_set(std::vector<std::string> &cmd, Response &out) {
 
         hm_insert(&g_data.db, &ent->node);
     }
+
+    return out_nil(out);
 }
 
-static void do_del(std::vector<std::string> &cmd, Response &out) {
+static void do_del(std::vector<std::string> &cmd, Buffer &out) {
     struct Entry key;       // dummy entry
     key.key.swap(cmd[1]);
     key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
@@ -232,9 +280,24 @@ static void do_del(std::vector<std::string> &cmd, Response &out) {
     if (node) {
         delete container_of(node, Entry, node);
     }
+
+    return out_int(out, node ? 1 : 0);
 }
 
-static void do_request(std::vector<std::string> &cmd, Response &out) {
+static bool cb_keys(HNode *node, void *args) {
+    Buffer &out = *(Buffer *)args;
+    const std::string &key = container_of(node, Entry, node)->key;
+
+    out_str(out, key.data(), key.size());
+    return true;
+}
+
+static void do_keys(std::vector<std::string> &cmd, Buffer &out) {
+    out_arr(out, (uint32_t)hm_size(&g_data.db));
+    hm_foreach(&g_data.db, cb_keys, (void *)&out);
+}
+
+static void do_request(std::vector<std::string> &cmd, Buffer &out) {
     if (cmd.size() == 2 && cmd[0] == "get") {
         return do_get(cmd, out);
     } else if (cmd.size() == 3 && cmd[0] == "set") {
@@ -242,15 +305,30 @@ static void do_request(std::vector<std::string> &cmd, Response &out) {
     } else if (cmd.size() == 2 && cmd[0] == "del") {
         return do_del(cmd, out);
     } else {
-        out.status = RES_ERR;
+        return out_err(out, ERR_UNKNOWN, "unknown commands");
     }
 }
 
-static void make_response(const Response &resp, std::vector<uint8_t> &out) {
-    uint32_t resp_len = 4 + (uint32_t)resp.data.size();
-    buf_append(out, (const uint8_t*)&resp_len, 4);
-    buf_append(out, (const uint8_t*)&resp.status, 4);
-    buf_append(out, (const uint8_t*)resp.data.data(), resp.data.size());
+static void response_begin(Buffer &out, size_t *header) {
+    *header = out.size();
+    buf_append_u32(out, 0);                                     // reserve 4 bytes for response header
+}
+
+static size_t response_size(Buffer &out, size_t header) {
+    return out.size() - header - 4;
+}
+
+static void response_end(Buffer &out, size_t header) {
+    size_t msg_size = response_size(out, header);
+    if (msg_size > k_max_msg) {
+        out.resize(header + 4);
+        out_err(out, ERR_TOO_BIG, "response is too big");
+        msg_size = response_size(out, header);
+    }
+
+    // message header
+    uint32_t len = (uint32_t)msg_size;
+    memcpy(&out[header], &len, 4);
 }
 
 static bool try_one_request(Conn* conn) {
@@ -280,11 +358,10 @@ static bool try_one_request(Conn* conn) {
     }
 
     // generate response
-    Response resp;
-
-    do_request(cmd, resp);
-
-    make_response(resp, conn->outgoing);
+    size_t header_pos = 0;
+    response_begin(conn->outgoing, &header_pos);
+    do_request(cmd, conn->outgoing);
+    response_end(conn->outgoing, header_pos);
 
     // clear incoming buffer
     buf_consume(conn->incoming, len + 4);

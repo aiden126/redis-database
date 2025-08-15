@@ -111,3 +111,27 @@ void hm_insert(HMap *hmap, HNode *node) {
     hm_help_rehashing(hmap);
 }
 
+void hm_clear(HMap *hmap) {
+    free(hmap->new_table.table);
+    free(hmap->old_table.table);
+    *hmap = HMap{};
+}
+
+size_t hm_size(HMap *hmap) {
+    return hmap->new_table.size + hmap->old_table.size;
+}
+
+static bool h_foreach(HTable *htab, bool (*f)(HNode *, void *), void *arg) {
+    for (size_t i = 0; htab->mask != 0 && i <= htab->mask; i++) {                   // walk through hashtable buckets
+        for (HNode *node = htab->table[i]; node != NULL; node = node->next) {
+            if (!f(node, arg)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+void hm_foreach(HMap *hmap, bool (*f)(HNode *, void *), void *arg) {
+    h_foreach(&hmap->new_table, f, arg) && h_foreach(&hmap->old_table, f, arg);
+}
