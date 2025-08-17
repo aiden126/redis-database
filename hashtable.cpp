@@ -135,3 +135,9 @@ static bool h_foreach(HTable *htab, bool (*f)(HNode *, void *), void *arg) {
 void hm_foreach(HMap *hmap, bool (*f)(HNode *, void *), void *arg) {
     h_foreach(&hmap->new_table, f, arg) && h_foreach(&hmap->old_table, f, arg);
 }
+
+void hm_clear(HMap *hmap) {
+    free(hmap->new_table.table);
+    free(hmap->old_table.table);
+    *hmap = HMap{};
+}

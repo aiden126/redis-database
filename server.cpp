@@ -15,9 +15,8 @@
 #include <map>
 
 #include "hashtable.h"
-
-#define container_of(ptr, T, member) \
-    ((T *)( (char *)ptr - offsetof(T, member) ))
+#include "zset.h"
+#include "common.h"
 
 /*
 struct sockaddr_in {
@@ -50,26 +49,43 @@ static struct {
     HMap db;
 } g_data;
 
+enum {
+    T_INIT = 0,
+    T_STR  = 1,
+    T_ZSET = 2,
+};
+
+// KV pair for hashtable
 struct Entry {
     struct HNode node;
     std::string key;
-    std::string value;
+
+    uint32_t type = 0;
+    union {
+        std::string str;
+        ZSet zset;
+    };
 };
+
+static Entry *entry_new(uint32_t type) {
+    Entry *ent = new Entry();
+    ent->type = type;
+    return ent;
+}
+
+static void entry_del(Entry *ent) {
+    if (ent->type == T_ZSET) {
+        zset_clear(&ent->zset);
+    }
+
+    delete ent; 
+}
 
 static bool entry_eq(HNode *lhs, HNode *rhs) {
     struct Entry *le = container_of(lhs, struct Entry, node);
     struct Entry *re = container_of(rhs, struct Entry, node);
 
     return le->key == re->key;
-}
-
-static uint64_t str_hash(const uint8_t *data, size_t len) {
-    uint32_t h = 0x811C9DC5;
-    for (size_t i = 0; i < len; i++) {
-        h = (h + data[i]) * 0x01000193;
-    }
-
-    return h;
 }
 
 static void fd_set_nb(int fd) {
