@@ -303,9 +303,9 @@ static void do_del(std::vector<std::string> &cmd, Buffer &out) {
     key.key.swap(cmd[1]);
     key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
 
-    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    HNode *node = hm_delete(&g_data.db, &key.node, &entry_eq);
     if (node) {
-        delete container_of(node, Entry, node);
+        entry_del(container_of(node, Entry, node));
     }
 
     return out_int(out, node ? 1 : 0);

@@ -1,5 +1,6 @@
 #include <string.h>
 #include <stdlib.h>
+#include <assert.h>
 
 #include "zset.h"
 #include "common.h"
@@ -120,6 +121,7 @@ void zset_delete(ZSet *zset, ZNode *node) {
     key.len = node->len;
 
     HNode *found = hm_delete(&zset->hmap, &key.node, &hcmp);
+    assert(found);
 
     // remove from AVL tree
     zset->root = avl_del(&node->tree);
