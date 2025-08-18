@@ -9,6 +9,7 @@
 #include <cstring>
 #include <poll.h>
 #include <fcntl.h>
+#include <math.h>
 
 #include <vector>
 #include <string>
@@ -61,10 +62,8 @@ struct Entry {
     std::string key;
 
     uint32_t type = 0;
-    union {
-        std::string str;
-        ZSet zset;
-    };
+    std::string str;
+    ZSet zset;
 };
 
 static Entry *entry_new(uint32_t type) {
@@ -101,8 +100,10 @@ static void buf_consume(std::vector<uint8_t> &buf, size_t n) {
 }
 
 enum {
-    ERR_UNKNOWN = 1,
-    ERR_TOO_BIG = 2,
+    ERR_UNKNOWN  = 1,
+    ERR_TOO_BIG  = 2,
+    ERR_BAD_TYPE = 3,
+    ERR_BAD_ARG  = 4,
 };
 
 enum {
@@ -162,6 +163,16 @@ static void out_err(Buffer &out, uint32_t code, const std::string &msg) {
     buf_append_u32(out, code);
     buf_append_u32(out, (uint32_t)msg.size());
     buf_append(out, (const uint8_t *)msg.data(), msg.size());
+}
+
+static size_t out_begin_arr(Buffer &out) {
+    out.push_back(TAG_ARR);
+    buf_append_u32(out, 0);
+    return out.size() - 4;
+}
+
+static void out_end_arr(Buffer &out, size_t ctx, uint32_t n) {
+    memcpy(&out[ctx], &n, 4);
 }
 
 // read (int) 4 bytes from byte stream
@@ -262,7 +273,7 @@ static void do_get(std::vector<std::string> &cmd, Buffer &out) {
         return out_nil(out);
     }
 
-    const std::string &val = container_of(node, struct Entry, node)->value;
+    const std::string &val = container_of(node, struct Entry, node)->str;
     return out_str(out, val.data(), val.size());
 }
 
@@ -274,12 +285,12 @@ static void do_set(std::vector<std::string> &cmd, Buffer &out) {
     HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
     if (node) {
         struct Entry *target = container_of(node, Entry, node);
-        target->value.swap(cmd[2]);
+        target->str.swap(cmd[2]);
     } else {
         struct Entry *ent = new Entry();
         ent->key.swap(key.key);
         ent->node.hcode = key.node.hcode;
-        ent->value.swap(cmd[2]);
+        ent->str.swap(cmd[2]);
 
         hm_insert(&g_data.db, &ent->node);
     }
@@ -308,18 +319,157 @@ static bool cb_keys(HNode *node, void *args) {
     return true;
 }
 
-static void do_keys(std::vector<std::string> &cmd, Buffer &out) {
+static void do_keys(std::vector<std::string> &, Buffer &out) {
     out_arr(out, (uint32_t)hm_size(&g_data.db));
     hm_foreach(&g_data.db, cb_keys, (void *)&out);
+}
+
+static bool str2dbl(const std::string &s, double &out) {
+    char *endp = NULL;
+    out = strtod(s.c_str(), &endp);
+    return endp == s.c_str() + s.size() && !isnan(out);
+}
+
+static bool str2int(const std::string &s, int64_t &out) {
+    char *endp = NULL;
+    out = strtoll(s.c_str(), &endp, 10);
+    return endp == s.c_str() + s.size();
+}
+
+static void do_zadd(std::vector<std::string> &cmd, Buffer &out) {
+    double score = 0;
+    if (!str2dbl(cmd[2], score)) {
+        return out_err(out, ERR_BAD_ARG, "expected fp value");
+    }
+
+    HNode node;
+    std::string key;
+
+    key.swap(cmd[1]);
+    node.hcode = str_hash((uint8_t *)key.data(), key.size());
+    
+    HNode *hnode = hm_lookup(&g_data.db, &node, &entry_eq);
+
+    Entry *ent = NULL;
+    if (!hnode) {
+        ent = entry_new(T_ZSET);
+        ent->key.swap(key);
+        ent->node.hcode = node.hcode;
+        hm_insert(&g_data.db, &ent->node);
+    } else {
+        ent = container_of(hnode, Entry, node);
+        if (ent->type != T_ZSET) {
+            return out_err(out, ERR_BAD_TYPE, "expected zset");
+        }
+    }
+
+    const std::string &name = cmd[3];
+    bool added = zset_insert(&ent->zset, name.data(), name.size(), score);
+    return out_int(out, (uint64_t)added);
+}
+
+static ZSet *expect_zset(std::string &s) {
+    struct HNode node;
+    std::string key;
+
+    key.swap(s);
+    node.hcode = str_hash((uint8_t *)key.data(), key.size());
+
+    HNode *hnode = hm_lookup(&g_data.db, &node, &entry_eq);
+    if (!hnode) {
+        return NULL;
+    }
+
+    Entry *ent = container_of(hnode, Entry, node);
+    return ent->type == T_ZSET ? &ent->zset : NULL;
+}
+
+static void do_zrem(std::vector<std::string> &cmd, Buffer &out) {
+    ZSet *zset = expect_zset(cmd[1]);
+    if (!zset) {
+        return out_err(out, ERR_BAD_TYPE, "expected zset");
+    }
+
+    const std::string &name = cmd[2];
+    ZNode *znode = zset_lookup(zset, name.data(), name.size());
+    if (znode) {
+        zset_delete(zset, znode);
+    }
+
+    return out_int(out, znode ? 1 : 0);
+}
+
+static void do_zscore(std::vector<std::string> &cmd, Buffer &out) {
+    ZSet *zset = expect_zset(cmd[1]);
+    if (!zset) {
+        return out_err(out, ERR_BAD_TYPE, "expected zset");
+    }
+
+    const std::string &name = cmd[2];
+    ZNode *znode = zset_lookup(zset, name.data(), name.size());
+
+    if (znode) {
+        out_dbl(out, znode->score);
+    } else {
+        out_nil(out);
+    }
+}
+
+static void do_zquery(std::vector<std::string> &cmd, Buffer &out) {
+    // parse arguments
+    double score = 0;
+    if (!str2dbl(cmd[2], score)) {
+        return out_err(out, ERR_BAD_ARG, "expected fp number");
+    }
+
+    const std::string &name = cmd[3];
+    int64_t offset = 0;
+    int64_t limit = 0;
+    if (!str2int(cmd[4], offset) || !str2int(cmd[5], limit)) {
+        return out_err(out, ERR_BAD_ARG, "expected int");
+    }
+
+    ZSet *zset = expect_zset(cmd[1]);
+    if (!zset) {
+        return out_err(out, ERR_BAD_TYPE, "expected zset");
+    }
+
+    if (limit <= 0) {
+        return out_arr(out, 0);
+    }
+
+    ZNode *znode = zset_seekge(zset, score, name.data(), name.size());
+    znode = znode_offset(znode, offset);
+
+    size_t ctx = out_begin_arr(out);
+    int64_t n = 0;
+    while (znode && n < limit) {
+        out_str(out, znode->name, znode->len);
+        out_dbl(out, znode->score);
+        znode = znode_offset(znode, 1);
+        n += 2;
+    }
+
+    out_end_arr(out, ctx, (uint32_t)n);
 }
 
 static void do_request(std::vector<std::string> &cmd, Buffer &out) {
     if (cmd.size() == 2 && cmd[0] == "get") {
         return do_get(cmd, out);
     } else if (cmd.size() == 3 && cmd[0] == "set") {
-        return do_set(cmd, out);                                 // faster than assignment and saves old value in cmd[2]
+        return do_set(cmd, out);
     } else if (cmd.size() == 2 && cmd[0] == "del") {
         return do_del(cmd, out);
+    } else if (cmd.size() == 1 && cmd[0] == "keys") {
+        return do_keys(cmd, out);
+    } else if (cmd.size() == 4 && cmd[0] == "zadd") {
+        return do_zadd(cmd, out);
+    } else if (cmd.size() == 3 && cmd[0] == "zrem") {
+        return do_zrem(cmd, out);
+    } else if (cmd.size() == 3 && cmd[0] == "zscore") {
+        return do_zscore(cmd, out);
+    } else if (cmd.size() == 6 && cmd[0] == "zquery") {
+        return do_zquery(cmd, out);
     } else {
         return out_err(out, ERR_UNKNOWN, "unknown commands");
     }

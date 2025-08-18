@@ -1,13 +1,19 @@
 CXX = g++
 CXXFLAGS = -Wall -Wextra
 
+SRCS = client.cpp server.cpp hashtable.cpp avl.cpp zset.cpp
+OBJS = $(SRCS.cpp=.o)
+
 all: client server
 
-client: client.cpp
-	$(CXX) $(CXXFLAGS) -o client client.cpp
+client: client.o
+	$(CXX) $(CXXFLAGS) -o $@ $^
 
-server: server.cpp hashtable.cpp hashtable.h
-	$(CXX) $(CXXFLAGS) -o server server.cpp hashtable.cpp
+server: server.o hashtable.o avl.o zset.o
+	$(CXX) $(CXXFLAGS) -o $@ $^
+
+%.o: %.cpp %.h
+	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 clean:
-	rm -f client server
+	rm -f *.o client server

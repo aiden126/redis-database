@@ -18,3 +18,4 @@ uint32_t avl_cnt(AVLNode *node);
 // API
 AVLNode *avl_fix(AVLNode *node);
 AVLNode *avl_del(AVLNode *node);
+AVLNode *avl_offset(AVLNode *node, int64_t offset);

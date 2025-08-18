@@ -25,16 +25,24 @@ static size_t min(size_t lhs, size_t rhs) {
     return lhs < rhs ? lhs : rhs;
 }
 
-static bool zless(AVLNode *lhs, AVLNode *rhs) {
+static bool zless(AVLNode *lhs, double score, const char *name, size_t len) {
     ZNode *zl = container_of(lhs, ZNode, tree);
-    ZNode *zr = container_of(rhs, ZNode, tree);
-
-    if (zl->score != zr->score) {
-        return zl->score < zr->score;
+    if (zl->score != score) {
+        return zl->score < score;
     }
 
-    int rv = memcmp(zl->name, zr->name, min(zl->len, zr->len));
-    return (rv != 0) ? (rv < 0) : (zl->len < zr->len);
+    int rv = memcmp(zl->name, name, min(zl->len, len));
+    if (rv != 0) {
+        return rv < 0;
+    }
+
+    return zl->len < len;
+}
+
+static bool zless(AVLNode *lhs, AVLNode *rhs) {
+    ZNode *zr = container_of(rhs, ZNode, tree);
+
+    return zless(lhs, zr->score, zr->name, zr->len);
 }
 
 static void tree_insert(ZSet *zset, ZNode *node) {
@@ -132,4 +140,29 @@ void zset_clear(ZSet *zset) {
     hm_clear(&zset->hmap);
     tree_dispose(zset->root);
     zset->root = NULL;
+}
+
+ZNode *zset_seekge(ZSet *zset, double score, const char *name, size_t len) {
+    AVLNode *found = NULL;
+    AVLNode *node = zset->root;
+
+    while (node) {
+        if (zless(node, score, name, len)) {
+            node = node->right;
+        } else {
+            found = node;
+            node = node->left;
+        }
+    }
+
+    return found ? container_of(found, ZNode, tree) : NULL;
+}
+
+ZNode *znode_offset(ZNode *node, int64_t offset) {
+    if (!node) {
+        return NULL;
+    }
+
+    AVLNode *tnode = avl_offset(&node->tree, offset);
+    return tnode ? container_of(tnode, ZNode, tree) : NULL;
 }
