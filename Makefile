@@ -1,8 +1,8 @@
 CXX = g++
-CXXFLAGS = -Wall -Wextra
+CXXFLAGS = -Wall -Wextra -g -O0
 
 SRCS = client.cpp server.cpp hashtable.cpp avl.cpp zset.cpp
-OBJS = $(SRCS.cpp=.o)
+OBJS = $(SRCS:.cpp=.o)
 
 all: client server
 

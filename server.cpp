@@ -614,6 +614,8 @@ static void process_timers() {
 }
 
 int main(void) {
+    dlist_init(&g_data.idle_list);
+
     int fd = socket(AF_INET, SOCK_STREAM, 0);
 
     int val = 1;
