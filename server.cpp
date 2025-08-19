@@ -10,6 +10,7 @@
 #include <poll.h>
 #include <fcntl.h>
 #include <math.h>
+#include <time.h>
 
 #include <vector>
 #include <string>
@@ -18,6 +19,7 @@
 #include "hashtable.h"
 #include "zset.h"
 #include "common.h"
+#include "dlist.h"
 
 const size_t k_max_msg = 4096;
 
@@ -30,12 +32,17 @@ struct Conn {
     bool want_write = false;
     bool want_close = false;
 
-    std::vector<uint8_t> incoming;
-    std::vector<uint8_t> outgoing;
+    Buffer incoming;
+    Buffer outgoing;
+
+    uint64_t last_active_ms = 0;
+    DList idle_node;
 };
 
 static struct {
     HMap db;
+    std::vector<Conn*> fd2conn; 
+    DList idle_list; 
 } g_data;
 
 enum {
@@ -75,6 +82,13 @@ static bool entry_eq(HNode *lhs, HNode *rhs) {
     return le->key == re->key;
 }
 
+static void conn_destroy(Conn *conn) {
+    close(conn->fd);
+    g_data.fd2conn[conn->fd] = NULL;
+    dlist_detach(&conn->idle_node);
+    delete conn;
+}
+
 static void fd_set_nb(int fd) {
     fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
 }
@@ -102,6 +116,12 @@ enum {
     TAG_DBL = 4,
     TAG_ARR = 5,
 };
+
+static uint64_t get_monotonic_msec() {
+    struct timespec tv = {0, 0};
+    clock_gettime(CLOCK_MONOTONIC, &tv);
+    return (uint64_t)tv.tv_sec * 1000 + tv.tv_nsec / 1000 / 1000;
+}
 
 // helper functions for serialization
 static void buf_append_u8(Buffer &buf, uint8_t data) {
@@ -490,14 +510,14 @@ static bool try_one_request(Conn* conn) {
     return true;
 }
 
-static Conn* handle_accept(int fd) {
+static uint32_t handle_accept(int fd) {
     // accept
     struct sockaddr_in client_addr = {};
     socklen_t addrlen = sizeof(client_addr);
 
     int conn_fd = accept(fd, (struct sockaddr*)&client_addr, &addrlen);
     if (conn_fd < 0) {
-        return NULL;
+        return -1;
     }
 
     // set the new fd connection to non blocking mode
@@ -506,7 +526,15 @@ static Conn* handle_accept(int fd) {
     Conn* conn = new Conn();
     conn->fd = conn_fd;
     conn->want_read = true;
-    return conn;
+    conn->last_active_ms = get_monotonic_msec();
+    dlist_insert_before(&g_data.idle_list, &conn->idle_node);
+
+    if (g_data.fd2conn.size() <= (size_t)conn->fd) {
+        g_data.fd2conn.resize(conn->fd + 1);
+    }
+    g_data.fd2conn[conn->fd] = conn;
+
+    return 0;
 }
 
 static void handle_write(Conn* conn) {
@@ -552,6 +580,39 @@ static void handle_read(Conn* conn) {
     }                                                                   // assume client is ready to be written to because it has sent a request
 }                                                                       // thus server can write a response without waiting for event loop
 
+const uint64_t k_idle_timeout_ms = 5 * 1000;
+
+static int32_t next_timer_ms() {
+    if (dlist_empty(&g_data.idle_list)) {
+        return 0;
+    }
+
+    uint64_t now_ms = get_monotonic_msec();
+    Conn *conn = container_of(g_data.idle_list.next, Conn, idle_node);
+    uint64_t next_ms = conn->last_active_ms + k_idle_timeout_ms;
+
+    if (next_ms <= now_ms) {
+        return 0;
+    }
+
+    return (uint32_t)(next_ms - now_ms);
+}
+
+static void process_timers() {
+    uint64_t now_ms = get_monotonic_msec();
+    while (!dlist_empty(&g_data.idle_list)) {
+        Conn *conn = container_of(g_data.idle_list.next, Conn, idle_node);
+        uint64_t next_ms = conn->last_active_ms + k_idle_timeout_ms;
+
+        if (next_ms >= now_ms) {
+            break;      // not expired
+        }
+
+        printf("removing idle connection %d\n", conn->fd);
+        conn_destroy(conn);
+    }
+}
+
 int main(void) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
 
@@ -575,7 +636,6 @@ int main(void) {
         return 1;
     }
 
-    std::vector<Conn*> fd2conn; 
     std::vector<struct pollfd> poll_args;
 
     while (true) { 
@@ -589,7 +649,7 @@ int main(void) {
         poll_args.push_back(pfd);
         
         // update poll() args for existing connections
-        for (Conn *conn : fd2conn) {
+        for (Conn *conn : g_data.fd2conn) {
             if (!conn)  
                 continue;
 
@@ -609,7 +669,8 @@ int main(void) {
             poll_args.push_back(pfd);
         }
 
-        int rv = poll(poll_args.data(), (nfds_t)poll_args.size(), -1);
+        int32_t timeout_ms = next_timer_ms();
+        int rv = poll(poll_args.data(), (nfds_t)poll_args.size(), timeout_ms);
         if (rv < 0 && errno == EINTR) {
             continue;                                                   // if received interrupt while waiting for a ready fds
         }
@@ -620,19 +681,20 @@ int main(void) {
 
         // handle listening socket (server)
         if (poll_args[0].revents) {
-            Conn* conn = handle_accept(fd);
-            if (conn) {
-                if (fd2conn.size() <= (size_t)conn->fd) {
-                    fd2conn.resize(conn->fd + 1);
-                }
-                fd2conn[conn->fd] = conn;
-            }
+            handle_accept(fd);
         }
 
         // handle client connections
         for (size_t i = 1; i < poll_args.size(); i++) {
             uint32_t ready = poll_args[i].revents;                      // retrieve poll() return
-            Conn* conn = fd2conn[poll_args[i].fd];
+            if (ready == 0) {
+                continue;
+            }
+
+            Conn *conn = g_data.fd2conn[poll_args[i].fd];
+            conn->last_active_ms = get_monotonic_msec();
+            dlist_detach(&conn->idle_node);
+            dlist_insert_before(&g_data.idle_list, &conn->idle_node);
 
             if (ready & POLLIN) {
                 handle_read(conn);
@@ -642,11 +704,11 @@ int main(void) {
             }
 
             if ((ready & POLLERR) || conn->want_close) {
-                (void)close(conn->fd);
-                fd2conn[conn->fd] = NULL;
-                delete conn;
+                conn_destroy(conn);
             }
         }
+
+        process_timers();
     }
 
     return 0;
