@@ -20,6 +20,7 @@
 #include "zset.h"
 #include "common.h"
 #include "dlist.h"
+#include "heap.h"
 
 const size_t k_max_msg = 4096;
 
@@ -43,6 +44,7 @@ static struct {
     HMap db;
     std::vector<Conn*> fd2conn; 
     DList idle_list; 
+    std::vector<HeapItem> heap;
 } g_data;
 
 enum {
@@ -56,10 +58,37 @@ struct Entry {
     struct HNode node;
     std::string key;
 
+    size_t heap_idx = -1;
+
     uint32_t type = 0;
     std::string str;
     ZSet zset;
 };
+
+static uint64_t get_monotonic_msec() {
+    struct timespec tv = {0, 0};
+    clock_gettime(CLOCK_MONOTONIC, &tv);
+    return (uint64_t)tv.tv_sec * 1000 + tv.tv_nsec / 1000 / 1000;
+}
+
+static void heap_delete(std::vector<HeapItem> &heap, size_t pos) {
+    heap[pos] = heap.back();
+    heap.pop_back();
+
+    if (pos > heap.size()) {
+        heap_update(heap.data(), pos, heap.size());
+    }
+}
+
+static void heap_upsert(std::vector<HeapItem> &heap, size_t pos, HeapItem item) {
+    if (pos < heap.size()) {
+        heap[pos] = item;
+    } else {
+        pos = heap.size();
+        heap.push_back(item);
+    }
+    heap_update(heap.data(), pos, heap.size());
+}
 
 static Entry *entry_new(uint32_t type) {
     Entry *ent = new Entry();
@@ -67,11 +96,23 @@ static Entry *entry_new(uint32_t type) {
     return ent;
 }
 
+static void entry_set_ttl(Entry *ent, size_t ttl_ms) {
+    if (ttl_ms < 0 && ent->heap_idx != (size_t)-1) {        // negative TTL means remove timer
+        heap_delete(g_data.heap, ent->heap_idx);
+        ent->heap_idx = -1;
+    } else if (ttl_ms >= 0) {
+        uint64_t expire_time = get_monotonic_msec() + (uint64_t)ttl_ms;
+        HeapItem item = {expire_time, &ent->heap_idx};
+        heap_upsert(g_data.heap, ent->heap_idx, item);
+    }
+}
+
 static void entry_del(Entry *ent) {
     if (ent->type == T_ZSET) {
         zset_clear(&ent->zset);
     }
 
+    entry_set_ttl(ent, -1);
     delete ent; 
 }
 
@@ -116,12 +157,6 @@ enum {
     TAG_DBL = 4,
     TAG_ARR = 5,
 };
-
-static uint64_t get_monotonic_msec() {
-    struct timespec tv = {0, 0};
-    clock_gettime(CLOCK_MONOTONIC, &tv);
-    return (uint64_t)tv.tv_sec * 1000 + tv.tv_nsec / 1000 / 1000;
-}
 
 // helper functions for serialization
 static void buf_append_u8(Buffer &buf, uint8_t data) {
@@ -429,6 +464,49 @@ static void do_zquery(std::vector<std::string> &cmd, Buffer &out) {
     out_end_arr(out, ctx, (uint32_t)n);
 }
 
+static void do_expire(std::vector<std::string> &cmd, Buffer &out) {
+    int64_t ttl_ms = 0;
+    if (!str2int(cmd[2], ttl_ms)) {
+        return out_err(out, ERR_BAD_ARG, "expected int");
+    }
+
+    struct HNode key_node;
+    std::string key;
+
+    key.swap(cmd[1]);
+    key_node.hcode = str_hash((uint8_t *)key.data(), key.size());
+
+    HNode *node = hm_lookup(&g_data.db, &key_node, &entry_eq);
+    if (node) {
+        Entry *ent = container_of(node, Entry, node);
+        entry_set_ttl(ent, ttl_ms);
+    }
+
+    return out_int(out, node ? 1 : 0);
+}
+
+static void do_ttl(std::vector<std::string> &cmd, Buffer &out) {
+    HNode key_node;
+    std::string key;
+
+    key.swap(cmd[1]);
+    key_node.hcode = str_hash((uint8_t *)key.data(), key.size());
+
+    HNode *node = hm_lookup(&g_data.db, &key_node, &entry_eq);
+    if (!node) {
+        return out_int(out, -2);    // not found
+    }
+
+    Entry *ent = container_of(node, Entry, node);
+    if (ent->heap_idx == (size_t)-1) {
+        return out_int(out, -1);    // no TTL
+    }
+
+    uint64_t expire_time = g_data.heap[ent->heap_idx].val;
+    uint64_t now_ms = get_monotonic_msec();
+    return out_int(out, expire_time > now_ms ? (expire_time - now_ms) : 0);
+}
+
 static void do_request(std::vector<std::string> &cmd, Buffer &out) {
     if (cmd.size() == 2 && cmd[0] == "get") {
         return do_get(cmd, out);
@@ -436,6 +514,10 @@ static void do_request(std::vector<std::string> &cmd, Buffer &out) {
         return do_set(cmd, out);
     } else if (cmd.size() == 2 && cmd[0] == "del") {
         return do_del(cmd, out);
+    } else if(cmd.size() == 3 && cmd[0] == "pexpire") {
+        return do_expire(cmd, out);
+    } else if (cmd.size() == 2 && cmd[0] == "pttl") {
+        return do_ttl(cmd, out);
     } else if (cmd.size() == 1 && cmd[0] == "keys") {
         return do_keys(cmd, out);
     } else if (cmd.size() == 4 && cmd[0] == "zadd") {
@@ -583,23 +665,42 @@ static void handle_read(Conn* conn) {
 const uint64_t k_idle_timeout_ms = 5 * 1000;
 
 static int32_t next_timer_ms() {
-    if (dlist_empty(&g_data.idle_list)) {
-        return 0;
+    uint64_t now_ms = get_monotonic_msec();
+    uint64_t next_ms = -1;
+
+    // idle timers for connections
+    if (!dlist_empty(&g_data.idle_list)) {
+        Conn *conn = container_of(g_data.idle_list.next, Conn, idle_node);
+        next_ms = conn->last_active_ms + k_idle_timeout_ms;
     }
 
-    uint64_t now_ms = get_monotonic_msec();
-    Conn *conn = container_of(g_data.idle_list.next, Conn, idle_node);
-    uint64_t next_ms = conn->last_active_ms + k_idle_timeout_ms;
+    // ttl timers entries
+    if (!g_data.heap.empty() && g_data.heap[0].val < next_ms) {
+        next_ms = g_data.heap[0].val;
+    }
+
+    if (next_ms == (size_t)-1) {
+        return -1;  // no timeouts
+    }
 
     if (next_ms <= now_ms) {
-        return 0;
+        return 0;   
     }
 
     return (uint32_t)(next_ms - now_ms);
 }
 
+const size_t k_max_work = 2000;
+
+static bool hnode_same(HNode *node, HNode *key) {
+    return node == key;
+}
+
+// delete expired timers
 static void process_timers() {
     uint64_t now_ms = get_monotonic_msec();
+
+    // idle timers for connections
     while (!dlist_empty(&g_data.idle_list)) {
         Conn *conn = container_of(g_data.idle_list.next, Conn, idle_node);
         uint64_t next_ms = conn->last_active_ms + k_idle_timeout_ms;
@@ -610,6 +711,21 @@ static void process_timers() {
 
         printf("removing idle connection %d\n", conn->fd);
         conn_destroy(conn);
+    }
+
+    // ttl timers for entries
+    const std::vector<HeapItem> &heap = g_data.heap;
+    size_t nworks = 0;
+
+    while (!heap.empty() && heap[0].val < now_ms) {
+        Entry *ent = container_of(heap[0].ref, Entry, heap_idx);
+        hm_delete(&g_data.db, &ent->node, &hnode_same);
+        printf("removing key %s\n", ent->key.c_str());
+        entry_del(ent);
+
+        if (nworks++ >= k_max_work) {
+            break;  // don't stall server if too many keys expires at once
+        }
     }
 }
 
