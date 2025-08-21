@@ -21,6 +21,7 @@
 #include "common.h"
 #include "dlist.h"
 #include "heap.h"
+#include "threadpool.h"
 
 const size_t k_max_msg = 4096;
 
@@ -45,6 +46,7 @@ static struct {
     std::vector<Conn*> fd2conn; 
     DList idle_list; 
     std::vector<HeapItem> heap;
+    ThreadPool thread_pool;
 } g_data;
 
 enum {
@@ -96,7 +98,7 @@ static Entry *entry_new(uint32_t type) {
     return ent;
 }
 
-static void entry_set_ttl(Entry *ent, size_t ttl_ms) {
+static void entry_set_ttl(Entry *ent, int64_t ttl_ms) {
     if (ttl_ms < 0 && ent->heap_idx != (size_t)-1) {        // negative TTL means remove timer
         heap_delete(g_data.heap, ent->heap_idx);
         ent->heap_idx = -1;
@@ -107,14 +109,31 @@ static void entry_set_ttl(Entry *ent, size_t ttl_ms) {
     }
 }
 
-static void entry_del(Entry *ent) {
+static void entry_del_sync(Entry *ent) {
     if (ent->type == T_ZSET) {
         zset_clear(&ent->zset);
     }
 
-    entry_set_ttl(ent, -1);
     delete ent; 
 }
+
+const size_t k_large_container_size = 1000;
+
+static void entry_del_func(void *arg) {
+    entry_del_sync((Entry *)arg);
+}
+
+static void entry_del(Entry *ent) {
+    entry_set_ttl(ent, -1);
+    
+    size_t set_size = (ent->type == T_ZSET) ? hm_size(&ent->zset.hmap) : 0;
+    if (set_size > k_large_container_size) {
+        thread_pool_queue(&g_data.thread_pool, &entry_del_func, ent);
+    } else {
+        entry_del_sync(ent);
+    }
+}
+
 
 static bool entry_eq(HNode *lhs, HNode *rhs) {
     struct Entry *le = container_of(lhs, struct Entry, node);
@@ -731,6 +750,7 @@ static void process_timers() {
 
 int main(void) {
     dlist_init(&g_data.idle_list);
+    thread_pool_init(&g_data.thread_pool, 4);
 
     int fd = socket(AF_INET, SOCK_STREAM, 0);
 
